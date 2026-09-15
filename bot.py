@@ -16,7 +16,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 # =========================================================
-# KIL VPN — настройки
+# RAF VPN — НАСТРОЙКИ
 # =========================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
@@ -24,7 +24,7 @@ try:
     ADMIN_ID = int(ADMIN_ID_RAW)
 except ValueError:
     ADMIN_ID = 0
-BOT_NAME = "KIL VPN"
+BOT_NAME = "RAF VPN"
 # GitHub
 GITHUB_OWNER = "bdtvyz76b6-blip"
 GITHUB_REPO = "sokolovvpn"
@@ -36,13 +36,15 @@ PORT = 10000
 # Оплата
 PRICE_STARS = 100
 SUBSCRIPTION_DAYS = 30
-# Сколько серверов получает каждый пользователь
+# Пробный период
+TRIAL_DAYS = 3
+# Серверов на пользователя
 SERVERS_PER_USER = 5
-# Локальная SQLite БД
-DB_FILE = "kil_vpn.sqlite3"
-VERSION = "KIL-VPN-1.0"
+# SQLite
+DB_FILE = "raf_vpn.sqlite3"
+VERSION = "RAF-VPN-2.0"
 # =========================================================
-# Проверка настроек
+# ПРОВЕРКА
 # =========================================================
 def check_config():
     errors = []
@@ -54,10 +56,10 @@ def check_config():
         errors.append("PUBLIC_URL")
     if errors:
         raise RuntimeError(
-            "Не заданы переменные/настройки: " + ", ".join(errors)
+            "Не заданы: " + ", ".join(errors)
         )
 # =========================================================
-# SQLite
+# DATABASE
 # =========================================================
 def db():
     conn = sqlite3.connect(DB_FILE)
@@ -70,7 +72,9 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             first_name TEXT,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            trial_used INTEGER DEFAULT 0,
+            blocked INTEGER DEFAULT 0
         )
     """)
     conn.execute("""
@@ -81,9 +85,28 @@ def init_db():
             content TEXT NOT NULL
         )
     """)
+    # Если база была создана старой версией
+    columns = [
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(users)"
+        ).fetchall()
+    ]
+    if "trial_used" not in columns:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN trial_used INTEGER DEFAULT 0"
+        )
+    if "blocked" not in columns:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN blocked INTEGER DEFAULT 0"
+        )
     conn.commit()
     conn.close()
-def save_user(user: Message):
+# =========================================================
+# USERS
+# =========================================================
+def save_user(message: Message):
+    user = message.from_user
     conn = db()
     conn.execute("""
         INSERT INTO users (
@@ -97,13 +120,60 @@ def save_user(user: Message):
             username = excluded.username,
             first_name = excluded.first_name
     """, (
-        user.from_user.id,
-        user.from_user.username or "",
-        user.from_user.first_name or "",
+        user.id,
+        user.username or "",
+        user.first_name or "",
         datetime.now(timezone.utc).isoformat(),
     ))
     conn.commit()
     conn.close()
+def get_user(user_id: int):
+    conn = db()
+    row = conn.execute("""
+        SELECT *
+        FROM users
+        WHERE user_id = ?
+    """, (user_id,)).fetchone()
+    conn.close()
+    return row
+def get_all_users():
+    conn = db()
+    rows = conn.execute("""
+        SELECT *
+        FROM users
+        ORDER BY created_at DESC
+    """).fetchall()
+    conn.close()
+    return rows
+def is_blocked(user_id: int):
+    user = get_user(user_id)
+    if not user:
+        return False
+    return bool(user["blocked"])
+def set_blocked(user_id: int, value: bool):
+    conn = db()
+    conn.execute("""
+        UPDATE users
+        SET blocked = ?
+        WHERE user_id = ?
+    """, (
+        1 if value else 0,
+        user_id,
+    ))
+    conn.commit()
+    conn.close()
+def mark_trial_used(user_id: int):
+    conn = db()
+    conn.execute("""
+        UPDATE users
+        SET trial_used = 1
+        WHERE user_id = ?
+    """, (user_id,))
+    conn.commit()
+    conn.close()
+# =========================================================
+# SUBSCRIPTIONS
+# =========================================================
 def get_subscription(user_id: int):
     conn = db()
     row = conn.execute("""
@@ -155,6 +225,14 @@ def update_subscription_content(
     ))
     conn.commit()
     conn.close()
+def delete_subscription(user_id: int):
+    conn = db()
+    conn.execute("""
+        DELETE FROM subscriptions
+        WHERE user_id = ?
+    """, (user_id,))
+    conn.commit()
+    conn.close()
 def get_active_subscriptions():
     conn = db()
     rows = conn.execute("""
@@ -166,9 +244,13 @@ def get_active_subscriptions():
     result = []
     for row in rows:
         try:
-            expires = datetime.fromisoformat(row["expires_at"])
+            expires = datetime.fromisoformat(
+                row["expires_at"]
+            )
             if expires.tzinfo is None:
-                expires = expires.replace(tzinfo=timezone.utc)
+                expires = expires.replace(
+                    tzinfo=timezone.utc
+                )
             if expires > now:
                 result.append(row)
         except Exception:
@@ -182,10 +264,16 @@ def get_stats():
     subscriptions = conn.execute(
         "SELECT COUNT(*) FROM subscriptions"
     ).fetchone()[0]
+    blocked = conn.execute(
+        "SELECT COUNT(*) FROM users WHERE blocked = 1"
+    ).fetchone()[0]
     conn.close()
-    return users, subscriptions
+    active = len(
+        get_active_subscriptions()
+    )
+    return users, subscriptions, active, blocked
 # =========================================================
-# Token
+# TOKEN
 # =========================================================
 def generate_token(length=32):
     chars = (
@@ -193,14 +281,12 @@ def generate_token(length=32):
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
         "0123456789"
     )
-    return "".join(random.choice(chars) for _ in range(length))
-def get_or_create_token(user_id: int):
-    existing = get_subscription(user_id)
-    if existing:
-        return existing["sub_token"]
-    return generate_token()
+    return "".join(
+        random.choice(chars)
+        for _ in range(length)
+    )
 # =========================================================
-# GitHub
+# GITHUB
 # =========================================================
 def github_raw_url():
     return (
@@ -213,18 +299,31 @@ def github_raw_url():
 async def fetch_servers():
     url = github_raw_url()
     headers = {
-        "User-Agent": "KIL-VPN-Bot"
+        "User-Agent": "RAF-VPN-Bot"
     }
-    github_token = os.getenv("GITHUB_TOKEN", "").strip()
+    github_token = os.getenv(
+        "GITHUB_TOKEN",
+        ""
+    ).strip()
     if github_token:
-        headers["Authorization"] = f"Bearer {github_token}"
-    timeout = aiohttp.ClientTimeout(total=20)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url, headers=headers) as response:
+        headers["Authorization"] = (
+            f"Bearer {github_token}"
+        )
+    timeout = aiohttp.ClientTimeout(
+        total=20
+    )
+    async with aiohttp.ClientSession(
+        timeout=timeout
+    ) as session:
+        async with session.get(
+            url,
+            headers=headers
+        ) as response:
             if response.status != 200:
                 text = await response.text()
                 raise RuntimeError(
-                    f"GitHub вернул HTTP {response.status}: {text[:300]}"
+                    f"GitHub HTTP {response.status}: "
+                    f"{text[:300]}"
                 )
             text = await response.text()
     servers = []
@@ -238,43 +337,99 @@ async def fetch_servers():
             servers.append(line)
     if not servers:
         raise RuntimeError(
-            "servers.txt пустой или серверы не найдены."
+            "servers.txt пустой."
         )
     return servers
 # =========================================================
-# Генерация серверов для пользователя
+# СЕРВЕРА
 # =========================================================
 def choose_servers(all_servers):
     count = min(
         SERVERS_PER_USER,
         len(all_servers)
     )
-    return random.sample(all_servers, count)
-def make_subscription_content(servers):
-    """
-    Делает Base64-список VPN-ссылок.
-    Каждый сервер — отдельная строка.
-    """
+    return random.sample(
+        all_servers,
+        count
+    )
+def make_subscription_content(
+    servers
+):
     raw = "\n".join(servers)
-    encoded = base64.b64encode(
+    return base64.b64encode(
         raw.encode("utf-8")
     ).decode("utf-8")
-    return encoded
 # =========================================================
-# URL подписки
+# SUB URL
 # =========================================================
 def subscription_url(token):
-    return f"{PUBLIC_URL.rstrip('/')}/sub/{token}"
+    return (
+        f"{PUBLIC_URL.rstrip('/')}"
+        f"/sub/{token}"
+    )
 # =========================================================
-# Telegram Bot
+# ВЫДАЧА ПОДПИСКИ
+# =========================================================
+async def create_or_extend_subscription(
+    user_id: int,
+    days: int,
+    use_new_servers=True
+):
+    servers = await fetch_servers()
+    selected_servers = choose_servers(
+        servers
+    )
+    content = make_subscription_content(
+        selected_servers
+    )
+    existing = get_subscription(
+        user_id
+    )
+    now = datetime.now(timezone.utc)
+    if existing:
+        try:
+            old_expires = datetime.fromisoformat(
+                existing["expires_at"]
+            )
+            if old_expires.tzinfo is None:
+                old_expires = old_expires.replace(
+                    tzinfo=timezone.utc
+                )
+        except Exception:
+            old_expires = now
+        start_date = max(
+            now,
+            old_expires
+        )
+        token = existing["sub_token"]
+    else:
+        start_date = now
+        token = generate_token()
+    expires_at = (
+        start_date +
+        timedelta(days=days)
+    )
+    save_subscription(
+        user_id=user_id,
+        expires_at=expires_at.isoformat(),
+        sub_token=token,
+        content=content
+    )
+    return expires_at, token
+# =========================================================
+# BOT
 # =========================================================
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 # =========================================================
-# Клавиатуры
+# КЛАВИАТУРЫ
 # =========================================================
 def main_keyboard():
     builder = InlineKeyboardBuilder()
+    builder.button(
+        text="🎁 Пробный период",
+        callback_data="trial"
+    )
     builder.button(
         text="💳 Купить VPN",
         callback_data="buy"
@@ -292,6 +447,10 @@ def main_keyboard():
 def admin_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(
+        text="👥 Пользователи",
+        callback_data="admin_users"
+    )
+    builder.button(
         text="🔄 Обновить серверы",
         callback_data="admin_refresh"
     )
@@ -301,139 +460,253 @@ def admin_keyboard():
     )
     builder.adjust(1)
     return builder.as_markup()
+def admin_user_keyboard(user_id):
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="➕ 7 дней",
+        callback_data=f"user_add7:{user_id}"
+    )
+    builder.button(
+        text="➕ 30 дней",
+        callback_data=f"user_add30:{user_id}"
+    )
+    builder.button(
+        text="❌ Забрать подписку",
+        callback_data=f"user_revoke:{user_id}"
+    )
+    user = get_user(user_id)
+    if user and user["blocked"]:
+        builder.button(
+            text="✅ Разблокировать",
+            callback_data=f"user_unblock:{user_id}"
+        )
+    else:
+        builder.button(
+            text="🚫 Заблокировать",
+            callback_data=f"user_block:{user_id}"
+        )
+    builder.button(
+        text="◀️ К пользователям",
+        callback_data="admin_users"
+    )
+    builder.adjust(2, 1, 1, 1)
+    return builder.as_markup()
 # =========================================================
-# /start
+# /START
 # =========================================================
 @dp.message(Command("start"))
-async def start_handler(message: Message):
+async def start_handler(
+    message: Message
+):
     save_user(message)
-    text = (
-        f"🔐 <b>{BOT_NAME}</b>\n\n"
-        "VPN с удобной подпиской через Telegram Stars.\n\n"
-        f"💰 Цена: <b>{PRICE_STARS} Stars</b>\n"
-        f"⏳ Срок: <b>{SUBSCRIPTION_DAYS} дней</b>\n\n"
-        "Нажми кнопку ниже, чтобы купить подписку."
-    )
+    if is_blocked(
+        message.from_user.id
+    ):
+        await message.answer(
+            "🚫 Вы заблокированы."
+        )
+        return
     await message.answer(
-        text,
+        f"🔐 <b>{BOT_NAME}</b>\n\n"
+        "Быстрый VPN с подпиской "
+        "через Telegram Stars.\n\n"
+        f"🎁 Пробный период: "
+        f"<b>{TRIAL_DAYS} дня</b>\n"
+        f"💰 Цена: "
+        f"<b>{PRICE_STARS} Stars</b>\n"
+        f"⏳ Подписка: "
+        f"<b>{SUBSCRIPTION_DAYS} дней</b>\n\n"
+        "Выберите действие:",
         reply_markup=main_keyboard()
     )
 # =========================================================
-# /admin
+# ПРОБНЫЙ ПЕРИОД
 # =========================================================
-@dp.message(Command("admin"))
-async def admin_handler(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ Доступ запрещён.")
+@dp.callback_query(F.data == "trial")
+async def trial_handler(
+    callback: CallbackQuery
+):
+    user_id = callback.from_user.id
+    if is_blocked(user_id):
+        await callback.answer(
+            "🚫 Вы заблокированы.",
+            show_alert=True
+        )
         return
-    await message.answer(
-        "🛠 <b>KIL VPN — админ-панель</b>\n\n"
-        "Управление серверами и статистика.",
-        reply_markup=admin_keyboard()
+    user = get_user(user_id)
+    if not user:
+        await callback.answer(
+            "Сначала нажмите /start",
+            show_alert=True
+        )
+        return
+    if user["trial_used"]:
+        await callback.answer(
+            "Вы уже использовали пробный период.",
+            show_alert=True
+        )
+        return
+    existing = get_subscription(user_id)
+    if existing:
+        try:
+            expires = datetime.fromisoformat(
+                existing["expires_at"]
+            )
+            if expires.tzinfo is None:
+                expires = expires.replace(
+                    tzinfo=timezone.utc
+                )
+            if expires > datetime.now(timezone.utc):
+                await callback.answer(
+                    "У вас уже есть активная подписка.",
+                    show_alert=True
+                )
+                return
+        except Exception:
+            pass
+    await callback.answer(
+        "Выдаю пробную подписку..."
     )
+    try:
+        expires_at, token = (
+            await create_or_extend_subscription(
+                user_id,
+                TRIAL_DAYS
+            )
+        )
+        mark_trial_used(user_id)
+        url = subscription_url(token)
+        await callback.message.answer(
+            f"🎁 <b>Пробный период активирован!</b>\n\n"
+            f"🔐 {BOT_NAME}\n"
+            f"⏳ До: "
+            f"<b>{expires_at.strftime('%d.%m.%Y %H:%M')} UTC</b>\n\n"
+            "🔗 <b>Ссылка:</b>\n"
+            f"<code>{url}</code>\n\n"
+            "После окончания можно купить полную подписку."
+        )
+    except Exception as e:
+        print(
+            "Ошибка trial:",
+            e
+        )
+        await callback.message.answer(
+            "❌ Не удалось выдать пробную подписку."
+        )
 # =========================================================
-# Покупка
+# ПОКУПКА
 # =========================================================
 @dp.callback_query(F.data == "buy")
-async def buy_handler(callback: CallbackQuery):
+async def buy_handler(
+    callback: CallbackQuery
+):
+    user_id = callback.from_user.id
+    if is_blocked(user_id):
+        await callback.answer(
+            "🚫 Вы заблокированы.",
+            show_alert=True
+        )
+        return
     await callback.answer()
     prices = [
         LabeledPrice(
-            label=f"{BOT_NAME} — {SUBSCRIPTION_DAYS} дней",
+            label=(
+                f"{BOT_NAME} — "
+                f"{SUBSCRIPTION_DAYS} дней"
+            ),
             amount=PRICE_STARS
         )
     ]
     await bot.send_invoice(
-        chat_id=callback.from_user.id,
+        chat_id=user_id,
         title=f"{BOT_NAME} — VPN",
         description=(
-            f"VPN подписка на {SUBSCRIPTION_DAYS} дней. "
-            f"Цена: {PRICE_STARS} Telegram Stars."
+            f"VPN подписка на "
+            f"{SUBSCRIPTION_DAYS} дней."
         ),
-        payload=f"kilvpn:{callback.from_user.id}",
+        payload=f"rafvpn:{user_id}",
         provider_token="",
         currency="XTR",
         prices=prices
     )
 # =========================================================
-# PreCheckout
+# PRE CHECKOUT
 # =========================================================
 @dp.pre_checkout_query()
-async def pre_checkout_handler(query: PreCheckoutQuery):
-    await query.answer(ok=True)
+async def pre_checkout_handler(
+    query: PreCheckoutQuery
+):
+    user_id = query.from_user.id
+    if is_blocked(user_id):
+        await query.answer(
+            ok=False,
+            error_message="Вы заблокированы."
+        )
+        return
+    await query.answer(
+        ok=True
+    )
 # =========================================================
-# Успешная оплата
+# УСПЕШНАЯ ОПЛАТА
 # =========================================================
 @dp.message(F.successful_payment)
-async def successful_payment_handler(message: Message):
-    payment = message.successful_payment
+async def successful_payment_handler(
+    message: Message
+):
     user_id = message.from_user.id
-    try:
-        servers = await fetch_servers()
-    except Exception as e:
-        await message.answer(
-            "⚠️ Оплата получена, но серверы сейчас "
-            "не удалось загрузить.\n\n"
-            "Обратитесь к администратору."
-        )
-        print("Ошибка загрузки серверов:", e)
+    if is_blocked(user_id):
         return
-    selected_servers = choose_servers(servers)
-    content = make_subscription_content(
-        selected_servers
-    )
-    existing = get_subscription(user_id)
-    now = datetime.now(timezone.utc)
-    if existing:
-        try:
-            old_expires = datetime.fromisoformat(
-                existing["expires_at"]
+    try:
+        expires_at, token = (
+            await create_or_extend_subscription(
+                user_id,
+                SUBSCRIPTION_DAYS
             )
-            if old_expires.tzinfo is None:
-                old_expires = old_expires.replace(
-                    tzinfo=timezone.utc
-                )
-        except Exception:
-            old_expires = now
-        start_date = max(now, old_expires)
-        token = existing["sub_token"]
-    else:
-        start_date = now
-        token = generate_token()
-    expires_at = (
-        start_date +
-        timedelta(days=SUBSCRIPTION_DAYS)
-    )
-    save_subscription(
-        user_id=user_id,
-        expires_at=expires_at.isoformat(),
-        sub_token=token,
-        content=content
-    )
-    url = subscription_url(token)
-    await message.answer(
-        f"✅ <b>Оплата получена!</b>\n\n"
-        f"🔐 {BOT_NAME}\n"
-        f"⏳ Действует до: "
-        f"<b>{expires_at.strftime('%d.%m.%Y %H:%M')}</b> UTC\n\n"
-        "🔗 <b>Ссылка на подписку:</b>\n"
-        f"<code>{url}</code>\n\n"
-        "Добавьте эту ссылку в ваше VPN-приложение."
-    )
+        )
+        url = subscription_url(token)
+        await message.answer(
+            f"✅ <b>Оплата получена!</b>\n\n"
+            f"🔐 {BOT_NAME}\n"
+            f"⏳ Действует до:\n"
+            f"<b>{expires_at.strftime('%d.%m.%Y %H:%M')} UTC</b>\n\n"
+            "🔗 <b>Ссылка на подписку:</b>\n"
+            f"<code>{url}</code>\n\n"
+            "Добавьте эту ссылку "
+            "в ваше VPN-приложение."
+        )
+    except Exception as e:
+        print(
+            "Ошибка выдачи подписки:",
+            e
+        )
+        await message.answer(
+            "⚠️ Оплата получена, "
+            "но подписку автоматически выдать "
+            "не удалось.\n\n"
+            "Администратор сможет выдать её "
+            "через админ-панель."
+        )
 # =========================================================
-# Моя подписка
+# МОЯ ПОДПИСКА
 # =========================================================
 @dp.callback_query(F.data == "my_sub")
 async def my_subscription_handler(
     callback: CallbackQuery
 ):
+    user_id = callback.from_user.id
+    if is_blocked(user_id):
+        await callback.answer(
+            "🚫 Вы заблокированы.",
+            show_alert=True
+        )
+        return
     await callback.answer()
     sub = get_subscription(
-        callback.from_user.id
+        user_id
     )
     if not sub:
         await callback.message.answer(
-            "❌ У вас пока нет активной подписки.",
+            "❌ Активной подписки нет.",
             reply_markup=main_keyboard()
         )
         return
@@ -447,10 +720,13 @@ async def my_subscription_handler(
             )
     except Exception:
         expires = None
-    if not expires or expires <= datetime.now(timezone.utc):
+    if (
+        not expires
+        or expires <= datetime.now(timezone.utc)
+    ):
         await callback.message.answer(
             "❌ Ваша подписка закончилась.\n\n"
-            "Нажмите «💳 Купить VPN», чтобы продлить.",
+            "Можно оформить новую подписку.",
             reply_markup=main_keyboard()
         )
         return
@@ -466,24 +742,384 @@ async def my_subscription_handler(
         reply_markup=main_keyboard()
     )
 # =========================================================
-# Помощь
+# ПОМОЩЬ
 # =========================================================
 @dp.callback_query(F.data == "help")
-async def help_handler(callback: CallbackQuery):
+async def help_handler(
+    callback: CallbackQuery
+):
     await callback.answer()
     await callback.message.answer(
         f"ℹ️ <b>{BOT_NAME}</b>\n\n"
-        "1. Нажмите «💳 Купить VPN».\n"
-        "2. Оплатите подписку через Telegram Stars.\n"
-        "3. Получите персональную ссылку.\n"
-        "4. Добавьте ссылку в своё VPN-приложение.\n\n"
-        "Каждому пользователю выдаётся "
-        "свой случайный набор серверов."
+        "1. Получите пробный период "
+        "или купите подписку.\n"
+        "2. Скопируйте ссылку.\n"
+        "3. Добавьте её в VPN-приложение.\n\n"
+        f"🎁 Пробный период: "
+        f"{TRIAL_DAYS} дня.\n"
+        f"💰 Полная подписка: "
+        f"{PRICE_STARS} Stars / "
+        f"{SUBSCRIPTION_DAYS} дней."
     )
 # =========================================================
-# Админ: обновление серверов
+# ADMIN
 # =========================================================
-@dp.callback_query(F.data == "admin_refresh")
+@dp.message(Command("admin"))
+async def admin_handler(
+    message: Message
+):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer(
+            "⛔ Доступ запрещён."
+        )
+        return
+    await message.answer(
+        "🛠 <b>RAF VPN — админ-панель</b>\n\n"
+        "Здесь можно управлять "
+        "пользователями и серверами.",
+        reply_markup=admin_keyboard()
+    )
+# =========================================================
+# ADMIN USERS
+# =========================================================
+@dp.callback_query(F.data == "admin_users")
+async def admin_users_handler(
+    callback: CallbackQuery
+):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer(
+            "⛔ Доступ запрещён.",
+            show_alert=True
+        )
+        return
+    await callback.answer()
+    users = get_all_users()
+    if not users:
+        await callback.message.edit_text(
+            "👥 Пользователей пока нет.",
+            reply_markup=admin_keyboard()
+        )
+        return
+    builder = InlineKeyboardBuilder()
+    for user in users[:50]:
+        name = (
+            user["first_name"]
+            or user["username"]
+            or str(user["user_id"])
+        )
+        if user["blocked"]:
+            prefix = "🚫"
+        else:
+            prefix = "👤"
+        builder.button(
+            text=f"{prefix} {name[:25]}",
+            callback_data=(
+                f"admin_user:{user['user_id']}"
+            )
+        )
+    builder.button(
+        text="◀️ Назад",
+        callback_data="admin_back"
+    )
+    builder.adjust(1)
+    await callback.message.edit_text(
+        f"👥 <b>Пользователи</b>\n\n"
+        f"Всего: <b>{len(users)}</b>\n\n"
+        "Выберите пользователя:",
+        reply_markup=builder.as_markup()
+    )
+# =========================================================
+# ADMIN USER DETAILS
+# =========================================================
+@dp.callback_query(
+    F.data.startswith("admin_user:")
+)
+async def admin_user_handler(
+    callback: CallbackQuery
+):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer(
+            "⛔ Доступ запрещён.",
+            show_alert=True
+        )
+        return
+    await callback.answer()
+    try:
+        user_id = int(
+            callback.data.split(":")[1]
+        )
+    except Exception:
+        return
+    user = get_user(user_id)
+    if not user:
+        await callback.message.edit_text(
+            "❌ Пользователь не найден.",
+            reply_markup=admin_keyboard()
+        )
+        return
+    sub = get_subscription(
+        user_id
+    )
+    name = user["first_name"] or "Без имени"
+    username = (
+        f"@{user['username']}"
+        if user["username"]
+        else "нет"
+    )
+    if user["blocked"]:
+        status = "🚫 Заблокирован"
+    else:
+        status = "🟢 Активен"
+    if sub:
+        try:
+            expires = datetime.fromisoformat(
+                sub["expires_at"]
+            )
+            if expires.tzinfo is None:
+                expires = expires.replace(
+                    tzinfo=timezone.utc
+                )
+            if expires > datetime.now(timezone.utc):
+                sub_text = (
+                    "🟢 Активна до "
+                    f"<b>{expires.strftime('%d.%m.%Y %H:%M')} UTC</b>"
+                )
+            else:
+                sub_text = "🔴 Истекла"
+        except Exception:
+            sub_text = "⚠️ Ошибка даты"
+    else:
+        sub_text = "❌ Нет подписки"
+    trial_text = (
+        "использован"
+        if user["trial_used"]
+        else "не использован"
+    )
+    await callback.message.edit_text(
+        "👤 <b>Пользователь</b>\n\n"
+        f"🆔 ID: <code>{user_id}</code>\n"
+        f"👤 Имя: <b>{name}</b>\n"
+        f"🔗 Username: {username}\n"
+        f"📅 Регистрация: "
+        f"{user['created_at'][:10]}\n\n"
+        f"📦 Подписка: {sub_text}\n"
+        f"🎁 Пробный период: {trial_text}\n"
+        f"📌 Статус: {status}",
+        reply_markup=admin_user_keyboard(
+            user_id
+        )
+    )
+# =========================================================
+# ADMIN ADD 7 DAYS
+# =========================================================
+@dp.callback_query(
+    F.data.startswith("user_add7:")
+)
+async def admin_add7_handler(
+    callback: CallbackQuery
+):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer(
+            "⛔ Доступ запрещён.",
+            show_alert=True
+        )
+        return
+    user_id = int(
+        callback.data.split(":")[1]
+    )
+    try:
+        expires_at, token = (
+            await create_or_extend_subscription(
+                user_id,
+                7
+            )
+        )
+        await callback.answer(
+            "✅ Выдано 7 дней"
+        )
+        await callback.message.edit_text(
+            "✅ <b>Подписка выдана</b>\n\n"
+            f"👤 ID: <code>{user_id}</code>\n"
+            f"⏳ До: "
+            f"<b>{expires_at.strftime('%d.%m.%Y %H:%M')} UTC</b>",
+            reply_markup=admin_user_keyboard(
+                user_id
+            )
+        )
+    except Exception as e:
+        print(e)
+        await callback.answer(
+            "Ошибка выдачи",
+            show_alert=True
+        )
+# =========================================================
+# ADMIN ADD 30 DAYS
+# =========================================================
+@dp.callback_query(
+    F.data.startswith("user_add30:")
+)
+async def admin_add30_handler(
+    callback: CallbackQuery
+):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer(
+            "⛔ Доступ запрещён.",
+            show_alert=True
+        )
+        return
+    user_id = int(
+        callback.data.split(":")[1]
+    )
+    try:
+        expires_at, token = (
+            await create_or_extend_subscription(
+                user_id,
+                30
+            )
+        )
+        await callback.answer(
+            "✅ Выдано 30 дней"
+        )
+        await callback.message.edit_text(
+            "✅ <b>Подписка выдана</b>\n\n"
+            f"👤 ID: <code>{user_id}</code>\n"
+            f"⏳ До: "
+            f"<b>{expires_at.strftime('%d.%m.%Y %H:%M')} UTC</b>",
+            reply_markup=admin_user_keyboard(
+                user_id
+            )
+        )
+    except Exception as e:
+        print(e)
+        await callback.answer(
+            "Ошибка выдачи",
+            show_alert=True
+        )
+# =========================================================
+# ADMIN REVOKE
+# =========================================================
+@dp.callback_query(
+    F.data.startswith("user_revoke:")
+)
+async def admin_revoke_handler(
+    callback: CallbackQuery
+):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer(
+            "⛔ Доступ запрещён.",
+            show_alert=True
+        )
+        return
+    user_id = int(
+        callback.data.split(":")[1]
+    )
+    delete_subscription(
+        user_id
+    )
+    await callback.answer(
+        "❌ Подписка забрана"
+    )
+    await callback.message.edit_text(
+        f"❌ <b>Подписка пользователя забрана</b>\n\n"
+        f"ID: <code>{user_id}</code>",
+        reply_markup=admin_user_keyboard(
+            user_id
+        )
+    )
+# =========================================================
+# ADMIN BLOCK
+# =========================================================
+@dp.callback_query(
+    F.data.startswith("user_block:")
+)
+async def admin_block_handler(
+    callback: CallbackQuery
+):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer(
+            "⛔ Доступ запрещён.",
+            show_alert=True
+        )
+        return
+    user_id = int(
+        callback.data.split(":")[1]
+    )
+    if user_id == ADMIN_ID:
+        await callback.answer(
+            "Нельзя заблокировать администратора.",
+            show_alert=True
+        )
+        return
+    set_blocked(
+        user_id,
+        True
+    )
+    await callback.answer(
+        "🚫 Пользователь заблокирован"
+    )
+    await callback.message.edit_text(
+        "🚫 <b>Пользователь заблокирован</b>\n\n"
+        f"ID: <code>{user_id}</code>",
+        reply_markup=admin_user_keyboard(
+            user_id
+        )
+    )
+# =========================================================
+# ADMIN UNBLOCK
+# =========================================================
+@dp.callback_query(
+    F.data.startswith("user_unblock:")
+)
+async def admin_unblock_handler(
+    callback: CallbackQuery
+):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer(
+            "⛔ Доступ запрещён.",
+            show_alert=True
+        )
+        return
+    user_id = int(
+        callback.data.split(":")[1]
+    )
+    set_blocked(
+        user_id,
+        False
+    )
+    await callback.answer(
+        "✅ Пользователь разблокирован"
+    )
+    await callback.message.edit_text(
+        "✅ <b>Пользователь разблокирован</b>\n\n"
+        f"ID: <code>{user_id}</code>",
+        reply_markup=admin_user_keyboard(
+            user_id
+        )
+    )
+# =========================================================
+# ADMIN BACK
+# =========================================================
+@dp.callback_query(F.data == "admin_back")
+async def admin_back_handler(
+    callback: CallbackQuery
+):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer(
+            "⛔ Доступ запрещён.",
+            show_alert=True
+        )
+        return
+    await callback.answer()
+    await callback.message.edit_text(
+        "🛠 <b>RAF VPN — админ-панель</b>",
+        reply_markup=admin_keyboard()
+    )
+# =========================================================
+# ADMIN REFRESH SERVERS
+# =========================================================
+@dp.callback_query(
+    F.data == "admin_refresh"
+)
 async def admin_refresh_handler(
     callback: CallbackQuery
 ):
@@ -497,16 +1133,20 @@ async def admin_refresh_handler(
         "Обновляю серверы..."
     )
     try:
-        # GitHub загружается ОДИН раз
+        # GitHub загружается один раз
         all_servers = await fetch_servers()
-        active_subs = get_active_subscriptions()
+        active_subs = (
+            get_active_subscriptions()
+        )
         updated = 0
         for sub in active_subs:
             selected_servers = choose_servers(
                 all_servers
             )
-            content = make_subscription_content(
-                selected_servers
+            content = (
+                make_subscription_content(
+                    selected_servers
+                )
             )
             update_subscription_content(
                 sub["user_id"],
@@ -515,25 +1155,30 @@ async def admin_refresh_handler(
             updated += 1
         await callback.message.answer(
             "✅ <b>Серверы обновлены</b>\n\n"
-            f"🌐 Всего серверов в GitHub: "
+            f"🌐 Серверов в GitHub: "
             f"<b>{len(all_servers)}</b>\n"
-            f"👤 Активных подписок обновлено: "
+            f"👥 Активных подписок: "
             f"<b>{updated}</b>\n\n"
-            "Для каждого пользователя создан "
+            "Каждый пользователь получил "
             "новый случайный набор серверов.\n\n"
-            "🔗 Ссылки подписок пользователей "
+            "🔗 Ссылки подписок "
             "<b>не изменились</b>."
         )
     except Exception as e:
-        print("Ошибка обновления серверов:", e)
+        print(
+            "Ошибка обновления:",
+            e
+        )
         await callback.message.answer(
-            "❌ Не удалось обновить серверы.\n\n"
+            "❌ Ошибка обновления серверов.\n\n"
             f"<code>{str(e)[:1000]}</code>"
         )
 # =========================================================
-# Админ: статистика
+# ADMIN STATS
 # =========================================================
-@dp.callback_query(F.data == "admin_stats")
+@dp.callback_query(
+    F.data == "admin_stats"
+)
 async def admin_stats_handler(
     callback: CallbackQuery
 ):
@@ -543,28 +1188,32 @@ async def admin_stats_handler(
             show_alert=True
         )
         return
-    users, subscriptions = get_stats()
-    active = len(
-        get_active_subscriptions()
+    users, subscriptions, active, blocked = (
+        get_stats()
     )
     await callback.answer()
     await callback.message.answer(
-        "📊 <b>KIL VPN — статистика</b>\n\n"
+        "📊 <b>RAF VPN — статистика</b>\n\n"
         f"👤 Пользователей: <b>{users}</b>\n"
         f"📦 Подписок: <b>{subscriptions}</b>\n"
-        f"🟢 Активных: <b>{active}</b>\n\n"
+        f"🟢 Активных: <b>{active}</b>\n"
+        f"🚫 Заблокировано: <b>{blocked}</b>\n\n"
+        f"🎁 Trial: <b>{TRIAL_DAYS} дня</b>\n"
         f"💰 Цена: <b>{PRICE_STARS} Stars</b>\n"
         f"⏳ Срок: <b>{SUBSCRIPTION_DAYS} дней</b>"
     )
 # =========================================================
-# Web server Render
+# WEB / RENDER
 # =========================================================
 async def health_handler(request):
     return web.Response(
-        text="KIL VPN OK"
+        text="RAF VPN OK"
     )
 async def subscription_handler(request):
-    token = request.match_info.get("token", "")
+    token = request.match_info.get(
+        "token",
+        ""
+    )
     conn = db()
     row = conn.execute("""
         SELECT *
@@ -590,7 +1239,9 @@ async def subscription_handler(request):
             status=500,
             text="Invalid subscription"
         )
-    if expires <= datetime.now(timezone.utc):
+    if expires <= datetime.now(
+        timezone.utc
+    ):
         return web.Response(
             status=403,
             text="Subscription expired"
@@ -621,7 +1272,7 @@ async def start_web_server():
         f"Web server started on port {PORT}"
     )
 # =========================================================
-# Main
+# MAIN
 # =========================================================
 async def main():
     check_config()
@@ -629,21 +1280,36 @@ async def main():
     print("=" * 50)
     print(f"{BOT_NAME} starting")
     print(f"Version: {VERSION}")
-    print(f"GitHub: {github_raw_url()}")
-    print(f"Price: {PRICE_STARS} Stars")
     print(
-        f"Subscription: {SUBSCRIPTION_DAYS} days"
+        f"GitHub: {github_raw_url()}"
     )
     print(
-        f"Servers per user: {SERVERS_PER_USER}"
+        f"Price: {PRICE_STARS} Stars"
     )
-    print(f"Public URL: {PUBLIC_URL}")
+    print(
+        f"Subscription: "
+        f"{SUBSCRIPTION_DAYS} days"
+    )
+    print(
+        f"Trial: {TRIAL_DAYS} days"
+    )
+    print(
+        f"Servers per user: "
+        f"{SERVERS_PER_USER}"
+    )
+    print(
+        f"Public URL: {PUBLIC_URL}"
+    )
     print("=" * 50)
     await start_web_server()
-    print("Telegram polling started")
+    print(
+        "Telegram polling started"
+    )
     await dp.start_polling(bot)
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("KIL VPN stopped")
+        print(
+            "RAF VPN stopped"
+        )
