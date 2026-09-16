@@ -89,7 +89,8 @@ def init_db():
             first_name TEXT,
             created_at TEXT NOT NULL,
             trial_used INTEGER DEFAULT 0,
-            blocked INTEGER DEFAULT 0
+            blocked INTEGER DEFAULT 0,
+            accepted_terms INTEGER DEFAULT 0
         )
     """)
     conn.execute("""
@@ -113,6 +114,10 @@ def init_db():
     if "blocked" not in columns:
         conn.execute(
             "ALTER TABLE users ADD COLUMN blocked INTEGER DEFAULT 0"
+        )
+    if "accepted_terms" not in columns:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN accepted_terms INTEGER DEFAULT 0"
         )
     conn.commit()
     conn.close()
@@ -181,6 +186,20 @@ def mark_trial_used(user_id: int):
     conn.execute("""
         UPDATE users
         SET trial_used = 1
+        WHERE user_id = ?
+    """, (user_id,))
+    conn.commit()
+    conn.close()
+def has_accepted_terms(user_id: int):
+    user = get_user(user_id)
+    if not user:
+        return False
+    return bool(user["accepted_terms"])
+def accept_terms(user_id: int):
+    conn = db()
+    conn.execute("""
+        UPDATE users
+        SET accepted_terms = 1
         WHERE user_id = ?
     """, (user_id,))
     conn.commit()
@@ -496,6 +515,26 @@ def main_keyboard():
     )
     builder.adjust(1)
     return builder.as_markup()
+def terms_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="📄 Пользовательское соглашение",
+        callback_data="terms_user"
+    )
+    builder.button(
+        text="🔒 Политика конфиденциальности",
+        callback_data="terms_privacy"
+    )
+    builder.button(
+        text="📜 Условия использования",
+        callback_data="terms_usage"
+    )
+    builder.button(
+        text="✅ Принять",
+        callback_data="terms_accept"
+    )
+    builder.adjust(1)
+    return builder.as_markup()
 def admin_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(
@@ -544,6 +583,45 @@ def admin_user_keyboard(user_id):
     builder.adjust(2, 1, 1, 1)
     return builder.as_markup()
 # =========================================================
+# ДОКУМЕНТЫ
+# =========================================================
+TERMS_TEXT = """
+📄 <b>Пользовательское соглашение</b>
+Используя RAF VPN, вы соглашаетесь с правилами сервиса.
+Пользователь обязуется использовать сервис только в законных целях и соблюдать законодательство своей страны.
+Использование сервиса означает согласие с настоящими условиями.
+"""
+PRIVACY_TEXT = """
+🔒 <b>Политика конфиденциальности</b>
+RAF VPN обрабатывает необходимые данные пользователя для работы сервиса.
+Могут сохраняться:
+• Telegram ID
+• имя пользователя
+• username
+• информация о подписке
+• дата создания аккаунта
+Данные используются для работы подписки, оплаты и управления аккаунтом.
+Мы не запрашиваем пароль от Telegram или данные банковской карты.
+"""
+USAGE_TEXT = """
+📜 <b>Условия использования</b>
+RAF VPN предоставляется для использования VPN-сервиса.
+Запрещается использовать сервис для незаконной деятельности, атак на чужие системы, распространения вредоносного ПО и других действий, нарушающих законодательство.
+Администрация вправе ограничить доступ к сервису при нарушении условий использования.
+"""
+def terms_message():
+    return (
+        "🔐 <b>RAF VPN</b>\n\n"
+        "Перед использованием сервиса необходимо "
+        "ознакомиться с документами и принять условия.\n\n"
+        "📄 Пользовательское соглашение\n"
+        "🔒 Политика конфиденциальности\n"
+        "📜 Условия использования\n\n"
+        "Нажимая «✅ Принять», вы подтверждаете, "
+        "что ознакомились с документами и соглашаетесь "
+        "с их условиями."
+    )
+# =========================================================
 # /START
 # =========================================================
 @dp.message(Command("start"))
@@ -558,7 +636,85 @@ async def start_handler(
             "🚫 Вы заблокированы."
         )
         return
+    user_id = message.from_user.id
+    if not has_accepted_terms(user_id):
+        await message.answer(
+            terms_message(),
+            reply_markup=terms_keyboard()
+        )
+        return
     await message.answer(
+        f"🔐 <b>{BOT_NAME}</b>\n\n"
+        "Быстрый VPN с подпиской "
+        "через Telegram Stars.\n\n"
+        f"🎁 Пробный период: "
+        f"<b>{TRIAL_DAYS} дня</b>\n"
+        f"💰 Цена: "
+        f"<b>{PRICE_STARS} Stars</b>\n"
+        f"⏳ Подписка: "
+        f"<b>{SUBSCRIPTION_DAYS} дней</b>\n\n"
+        "Выберите действие:",
+        reply_markup=main_keyboard()
+    )
+# =========================================================
+# ДОКУМЕНТ — СОГЛАШЕНИЕ
+# =========================================================
+@dp.callback_query(F.data == "terms_user")
+async def terms_user_handler(
+    callback: CallbackQuery
+):
+    await callback.answer()
+    await callback.message.answer(
+        TERMS_TEXT,
+        reply_markup=terms_keyboard()
+    )
+# =========================================================
+# ДОКУМЕНТ — ПОЛИТИКА
+# =========================================================
+@dp.callback_query(F.data == "terms_privacy")
+async def terms_privacy_handler(
+    callback: CallbackQuery
+):
+    await callback.answer()
+    await callback.message.answer(
+        PRIVACY_TEXT,
+        reply_markup=terms_keyboard()
+    )
+# =========================================================
+# ДОКУМЕНТ — УСЛОВИЯ
+# =========================================================
+@dp.callback_query(F.data == "terms_usage")
+async def terms_usage_handler(
+    callback: CallbackQuery
+):
+    await callback.answer()
+    await callback.message.answer(
+        USAGE_TEXT,
+        reply_markup=terms_keyboard()
+    )
+# =========================================================
+# ПРИНЯТИЕ УСЛОВИЙ
+# =========================================================
+@dp.callback_query(F.data == "terms_accept")
+async def terms_accept_handler(
+    callback: CallbackQuery
+):
+    user_id = callback.from_user.id
+    if is_blocked(user_id):
+        await callback.answer(
+            "🚫 Вы заблокированы.",
+            show_alert=True
+        )
+        return
+    accept_terms(user_id)
+    await callback.answer(
+        "✅ Условия приняты!"
+    )
+    await callback.message.edit_text(
+        "✅ <b>Условия приняты!</b>\n\n"
+        "Теперь вам доступен RAF VPN."
+    )
+    await callback.message.answer(
         f"🔐 <b>{BOT_NAME}</b>\n\n"
         "Быстрый VPN с подпиской "
         "через Telegram Stars.\n\n"
@@ -589,6 +745,12 @@ async def trial_handler(
     if not user:
         await callback.answer(
             "Сначала нажмите /start",
+            show_alert=True
+        )
+        return
+    if not has_accepted_terms(user_id):
+        await callback.answer(
+            "Сначала примите условия.",
             show_alert=True
         )
         return
@@ -656,6 +818,12 @@ async def buy_handler(
     if is_blocked(user_id):
         await callback.answer(
             "🚫 Вы заблокированы.",
+            show_alert=True
+        )
+        return
+    if not has_accepted_terms(user_id):
+        await callback.answer(
+            "Сначала примите условия.",
             show_alert=True
         )
         return
@@ -1339,8 +1507,12 @@ async def main():
     check_config()
     init_db()
     print("=" * 50)
-    print(f"{BOT_NAME} starting")
-    print(f"Version: {VERSION}")
+    print(
+        f"{BOT_NAME} starting"
+    )
+    print(
+        f"Version: {VERSION}"
+    )
     print(
         f"GitHub: {github_raw_url()}"
     )
